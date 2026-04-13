@@ -1,0 +1,285 @@
+---
+title: "NBA Career Outcomes Prediction"
+format: html
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+library(hoopR)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(purrr)
+```
+
+## Project Overview
+
+Given a player's first few seasons in the NBA, predict their career outcome tier:
+
+- **Out of League**: washed out quickly, minimal career MPG
+- **Role Player**: bench contributor, 10–20 MPG
+- **Starter**: regular starter, 20+ MPG sustained
+- **All-Star**: ≥1 All-Star selection
+
+We will use multinomial logistic regression and random forest models with features derived from players' first 1–3 seasons.
+
+---
+
+## Data Collection
+
+Pull league-wide per-season stats using `hoopR::nba_leaguedashplayerstats()` for seasons 2000–2015. Cache to disk to avoid re-scraping.
+
+```{r load-season-stats, message=FALSE, warning=FALSE}
+seasons <- 2000:2015
+cache_file <- "data/season_stats.rds"
+
+if (!file.exists(cache_file)) {
+  dir.create("data", showWarnings = FALSE)
+  season_stats_raw <- map_dfr(seasons, function(yr) {
+    Sys.sleep(0.6)  # be polite to the API
+    tryCatch(
+      nba_leaguedashplayerstats(season = year_to_season(yr)) |>
+        pluck("LeagueDashPlayerStats") |>
+        mutate(season = yr),
+      error = function(e) NULL
+    )
+  })
+  saveRDS(season_stats_raw, cache_file)
+} else {
+  season_stats_raw <- readRDS(cache_file)
+}
+```
+
+```{r clean-stats}
+season_stats <- season_stats_raw |>
+  transmute(
+    player_id  = as.integer(PLAYER_ID),
+    player     = PLAYER_NAME,
+    season     = season,
+    gp         = as.numeric(GP),
+    min_pg     = as.numeric(MIN),
+    ppg        = as.numeric(PTS),
+    rpg        = as.numeric(REB),
+    apg        = as.numeric(AST),
+    spg        = as.numeric(STL),
+    bpg        = as.numeric(BLK),
+    fg_pct     = as.numeric(FG_PCT),
+    fg3_pct    = as.numeric(FG3_PCT),
+    ft_pct     = as.numeric(FT_PCT),
+    age        = as.numeric(AGE)
+  ) |>
+  filter(gp >= 10)  # drop injury-shortened stints
+```
+
+## Career Outcome Labels
+
+Label each player by their peak career tier. Pull each player's full career stats once, then classify.
+
+```{r career-labels, message=FALSE, warning=FALSE}
+all_star_cache <- "data/allstar_playerids.rds"
+
+if (!file.exists(all_star_cache)) {
+  # All-Star rosters are available via nba_allstarballotpredictor or
+  # we approximate using seasons where a player averaged 20+ PPG and 3+ ASG appearances.
+  # Use nba_leaguedashplayerstats filtered to All-Star seasons (2000-2015) as a proxy:
+  # Players who appeared in the top scoring tier consistently are labeled All-Star.
+  # For a cleaner label, pull each player's career accolades via nba_playercareerstats.
+  player_ids <- unique(season_stats$player_id)
+
+  career_raw <- map(player_ids, function(pid) {
+    Sys.sleep(0.4)
+    tryCatch({
+      res <- nba_playercareerstats(player_id = pid)
+      list(
+        totals  = res |> pluck("CareerTotalsRegularSeason"),
+        seasons = res |> pluck("SeasonTotalsRegularSeason")
+      )
+    }, error = function(e) NULL)
+  })
+
+  saveRDS(career_raw, all_star_cache)
+} else {
+  career_raw <- readRDS(all_star_cache)
+}
+
+# Cache was saved as a flat list of CareerTotalsRegularSeason data frames
+# with a lowercase player_id column already attached
+career_totals <- career_raw |>
+  compact() |>
+  bind_rows() |>
+  transmute(
+    player_id  = as.integer(player_id),
+    career_gp  = as.numeric(GP),
+    career_min = as.numeric(MIN),
+    career_ppg = as.numeric(PTS) / as.numeric(GP),
+    career_mpg = as.numeric(MIN) / as.numeric(GP),
+    # Approximate seasons from observed season stats (no season-by-season data in cache)
+    career_seasons = career_gp / 55
+  )
+
+# All-Star approximation: players with career PPG > 18 and 10+ seasons → All-Star
+# Starter: career MPG >= 28 | PPG >= 14
+# Role Player: career MPG 15–28 and career_seasons >= 4
+# Out of League: everything else (short careers, low minutes)
+player_labels <- career_totals |>
+  mutate(
+    outcome = case_when(
+      career_ppg >= 18 & career_seasons >= 8             ~ "All-Star",
+      career_mpg >= 28 | (career_ppg >= 14 & career_seasons >= 6) ~ "Starter",
+      career_mpg >= 15 & career_seasons >= 4              ~ "Role Player",
+      TRUE                                                 ~ "Out of League"
+    ),
+    outcome = factor(outcome,
+                     levels = c("Out of League", "Role Player", "Starter", "All-Star"))
+  ) |>
+  select(player_id, outcome, career_ppg, career_mpg, career_seasons)
+```
+
+```{r join-draft}
+# Pull draft info for each player
+draft_cache <- "data/draft_info.rds"
+
+if (!file.exists(draft_cache)) {
+  draft_raw <- map(unique(season_stats$player_id), function(pid) {
+    Sys.sleep(0.003)
+    tryCatch(
+      nba_commonplayerinfo(player_id = pid) |>
+        pluck("CommonPlayerInfo") |>
+        mutate(player_id = pid),
+      error = function(e) NULL
+    )
+  })
+  saveRDS(draft_raw, draft_cache)
+} else {
+  draft_raw <- readRDS(draft_cache)
+}
+
+draft_info <- draft_raw |>
+  compact() |>
+  bind_rows() |>
+  transmute(
+    player_id  = as.integer(player_id),
+    draft_pick = suppressWarnings(as.numeric(DRAFT_NUMBER))
+  ) |>
+  filter(!is.na(draft_pick))
+```
+
+```{r build-model-data}
+# Identify each player's debut season, then keep their first 3 seasons
+debut_season <- season_stats |>
+  group_by(player_id) |>
+  summarise(debut = min(season), .groups = "drop")
+
+first3 <- season_stats |>
+  left_join(debut_season, by = "player_id") |>
+  filter(season <= debut + 2) |>
+  group_by(player_id) |>
+  summarise(
+    across(c(ppg, rpg, apg, spg, bpg, fg_pct, fg3_pct, ft_pct, min_pg),
+           mean, na.rm = TRUE, .names = "avg_{.col}"),
+    n_seasons = n(),
+    .groups = "drop"
+  )
+
+model_data <- first3 |>
+  inner_join(player_labels, by = "player_id") |>
+  inner_join(draft_info,   by = "player_id") |>
+  filter(n_seasons >= 1)
+
+glimpse(model_data)
+```
+
+---
+
+## Exploratory Visualizations
+
+### Visualization 1: Draft Position by Career Outcome
+
+```{r viz1-draft, fig.width=8, fig.height=5}
+model_data |>
+  filter(draft_pick <= 60) |>
+  ggplot(aes(x = outcome, y = draft_pick, fill = outcome)) +
+  geom_violin(alpha = 0.4, color = NA) +
+  geom_boxplot(width = 0.2, outlier.shape = NA, alpha = 0.8) +
+  geom_jitter(width = 0.12, size = 1.5, alpha = 0.4, color = "gray30") +
+  scale_y_reverse(breaks = c(1, 10, 20, 30, 45, 60)) +
+  scale_fill_manual(values = c(
+    "Out of League" = "#d73027",
+    "Role Player"   = "#fc8d59",
+    "Starter"       = "#4575b4",
+    "All-Star"      = "#1a9850"
+  )) +
+  labs(
+    title    = "Draft Position by Career Outcome",
+    subtitle = "Lower pick number = higher draft position  |  2000–2015 draft classes",
+    x = "Career Outcome", y = "Draft Pick Number"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "none")
+```
+
+### Visualization 2: PPG in First 3 Seasons by Career Outcome
+
+```{r viz2-ppg, fig.width=8, fig.height=5}
+model_data |>
+  ggplot(aes(x = avg_ppg, fill = outcome, color = outcome)) +
+  geom_density(alpha = 0.35, linewidth = 0.8) +
+  scale_fill_manual(values = c(
+    "Out of League" = "#d73027",
+    "Role Player"   = "#fc8d59",
+    "Starter"       = "#4575b4",
+    "All-Star"      = "#1a9850"
+  )) +
+  scale_color_manual(values = c(
+    "Out of League" = "#d73027",
+    "Role Player"   = "#fc8d59",
+    "Starter"       = "#4575b4",
+    "All-Star"      = "#1a9850"
+  )) +
+  labs(
+    title    = "PPG Distribution (First 3 Seasons) by Career Outcome",
+    subtitle = "Average over each player's first 1–3 seasons",
+    x = "Points Per Game", y = "Density",
+    fill = "Outcome", color = "Outcome"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "bottom")
+```
+
+### Visualization 3: Career Scoring Trajectory by Outcome Tier
+
+```{r viz3-trajectories, fig.width=9, fig.height=5, message=FALSE, warning=FALSE}
+# For a random sample of players per tier, show their season PPG over first 3 years
+set.seed(42)
+sampled_ids <- model_data |>
+  group_by(outcome) |>
+  slice_sample(n = 10) |>
+  pull(player_id)
+
+traj_data <- season_stats |>
+  inner_join(debut_season, by = "player_id") |>
+  filter(player_id %in% sampled_ids, season <= debut + 2) |>
+  mutate(year_in_league = season - debut + 1) |>
+  inner_join(select(player_labels, player_id, outcome), by = "player_id")
+
+ggplot(traj_data, aes(x = year_in_league, y = ppg,
+                       group = player_id, color = outcome)) +
+  geom_line(alpha = 0.4, linewidth = 0.8) +
+  geom_point(alpha = 0.6, size = 2) +
+  stat_summary(aes(group = outcome), fun = mean,
+               geom = "line", linewidth = 2, linetype = "dashed") +
+  scale_color_manual(values = c(
+    "Out of League" = "#d73027",
+    "Role Player"   = "#fc8d59",
+    "Starter"       = "#4575b4",
+    "All-Star"      = "#1a9850"
+  )) +
+  scale_x_continuous(breaks = 1:3, labels = c("Year 1", "Year 2", "Year 3")) +
+  labs(
+    title    = "Scoring Trajectory in First 3 Seasons by Career Outcome",
+    subtitle = "Thin = individual players (sample of 10/tier)  |  Dashed = tier average",
+    x = "Season in League", y = "Points Per Game",
+    color = "Outcome"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "right")
+```
