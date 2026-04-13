@@ -140,7 +140,7 @@ player_labels <- career_totals |>
     outcome = factor(outcome,
                      levels = c("Out of League", "Role Player", "Starter", "All-Star"))
   ) |>
-  select(player_id, outcome, career_ppg, career_mpg, career_seasons)
+  dplyr::select(player_id, outcome, career_ppg, career_mpg, career_seasons)
 ```
 
 ```{r join-draft}
@@ -268,7 +268,7 @@ traj_data <- season_stats |>
   inner_join(debut_season, by = "player_id") |>
   filter(player_id %in% sampled_ids, season <= debut + 2) |>
   mutate(year_in_league = season - debut + 1) |>
-  inner_join(select(player_labels, player_id, outcome), by = "player_id")
+  inner_join(dplyr::select(player_labels, player_id, outcome), by = "player_id")
 
 ggplot(traj_data, aes(x = year_in_league, y = ppg,
                        group = player_id, color = outcome)) +
@@ -302,7 +302,7 @@ ggplot(traj_data, aes(x = year_in_league, y = ppg,
 ```{r split}
 set.seed(42)
 model_data_clean <- model_data |>
-  select(outcome, draft_pick, avg_ppg, avg_rpg, avg_apg, avg_spg, avg_bpg,
+  dplyr::select(outcome, draft_pick, avg_ppg, avg_rpg, avg_apg, avg_spg, avg_bpg,
          avg_fg_pct, avg_fg3_pct, avg_ft_pct, avg_min_pg, n_seasons) |>
   na.omit()
 
@@ -319,31 +319,43 @@ table(train_data$outcome)
 ### Model 1: Multinomial Logistic Regression
 
 ```{r multinom-fit, message=FALSE, warning=FALSE}
-set.seed(42)
-mlr_fit <- multinom(
-  outcome ~ draft_pick + avg_ppg + avg_rpg + avg_apg + avg_spg + avg_bpg +
-    avg_fg_pct + avg_fg3_pct + avg_ft_pct + avg_min_pg + n_seasons,
-  data  = train_data,
-  trace = FALSE,
-  maxit = 500
-)
+mlr_cache <- "models/mlr_fit.rds"
+if (!file.exists(mlr_cache)) {
+  set.seed(42)
+  mlr_fit <- multinom(
+    outcome ~ draft_pick + avg_ppg + avg_rpg + avg_apg + avg_spg + avg_bpg +
+      avg_fg_pct + avg_fg3_pct + avg_ft_pct + avg_min_pg + n_seasons,
+    data  = train_data,
+    trace = FALSE,
+    maxit = 500
+  )
+  saveRDS(mlr_fit, mlr_cache)
+} else {
+  mlr_fit <- readRDS(mlr_cache)
+}
 summary(mlr_fit)
 ```
 
-```{r multinom-bootstrap, cache=TRUE}
-# Bootstrap 95% CIs on coefficients (500 resamples)
-set.seed(42)
-B <- 500
-boot_coefs <- replicate(B, {
-  idx  <- sample(nrow(train_data), replace = TRUE)
-  fit  <- multinom(
-    outcome ~ draft_pick + avg_ppg + avg_rpg + avg_apg + avg_spg + avg_bpg +
-      avg_fg_pct + avg_fg3_pct + avg_ft_pct + avg_min_pg + n_seasons,
-    data  = train_data[idx, ],
-    trace = FALSE, maxit = 500
-  )
-  coef(fit)
-}, simplify = FALSE)
+```{r multinom-bootstrap}
+boot_cache <- "models/mlr_boot.rds"
+if (!file.exists(boot_cache)) {
+  # Bootstrap 95% CIs on coefficients (500 resamples)
+  set.seed(42)
+  B <- 500
+  boot_coefs <- replicate(B, {
+    idx  <- sample(nrow(train_data), replace = TRUE)
+    fit  <- multinom(
+      outcome ~ draft_pick + avg_ppg + avg_rpg + avg_apg + avg_spg + avg_bpg +
+        avg_fg_pct + avg_fg3_pct + avg_ft_pct + avg_min_pg + n_seasons,
+      data  = train_data[idx, ],
+      trace = FALSE, maxit = 500
+    )
+    coef(fit)
+  }, simplify = FALSE)
+  saveRDS(boot_coefs, boot_cache)
+} else {
+  boot_coefs <- readRDS(boot_cache)
+}
 
 # Combine into array and compute CIs
 boot_array <- simplify2array(boot_coefs)   # [classes, predictors, B]
@@ -395,29 +407,35 @@ coef(mlr_fit) |>
 
 ### Model 2: Random Forest
 
-```{r rf-fit, cache=TRUE}
-set.seed(42)
-p <- ncol(train_data) - 1   # number of predictors
+```{r rf-fit}
+rf_cache <- "models/rf_fit.rds"
+if (!file.exists(rf_cache)) {
+  set.seed(42)
+  p <- ncol(train_data) - 1   # number of predictors
 
-# Simple CV to choose mtry
-mtry_candidates <- c(floor(sqrt(p)), floor(p / 3))
-cv_oob <- sapply(mtry_candidates, function(m) {
-  ranger(
+  # Simple CV to choose mtry
+  mtry_candidates <- c(floor(sqrt(p)), floor(p / 3))
+  cv_oob <- sapply(mtry_candidates, function(m) {
+    ranger(
+      outcome ~ ., data = train_data,
+      num.trees = 500, mtry = m,
+      importance = "impurity", seed = 42
+    )$prediction.error
+  })
+
+  best_mtry <- mtry_candidates[which.min(cv_oob)]
+  cat("Best mtry:", best_mtry, " | OOB errors:", round(cv_oob, 3), "\n")
+
+  rf_fit <- ranger(
     outcome ~ ., data = train_data,
-    num.trees = 500, mtry = m,
-    importance = "impurity", seed = 42
-  )$prediction.error
-})
-
-best_mtry <- mtry_candidates[which.min(cv_oob)]
-cat("Best mtry:", best_mtry, " | OOB errors:", round(cv_oob, 3), "\n")
-
-rf_fit <- ranger(
-  outcome ~ ., data = train_data,
-  num.trees = 500, mtry = best_mtry,
-  importance = "impurity", seed = 42,
-  probability = FALSE
-)
+    num.trees = 500, mtry = best_mtry,
+    importance = "impurity", seed = 42,
+    probability = FALSE
+  )
+  saveRDS(rf_fit, rf_cache)
+} else {
+  rf_fit <- readRDS(rf_cache)
+}
 
 cat("OOB error rate:", round(rf_fit$prediction.error, 3), "\n")
 ```
@@ -446,7 +464,7 @@ data.frame(predictor = names(vimp), importance = vimp) |>
 
 ### Model 3: Bayesian Multinomial Logistic Regression
 
-```{r stan-model, cache=TRUE, results="hide", message=FALSE, warning=FALSE}
+```{r stan-model, results="hide", message=FALSE, warning=FALSE}
 # Reduced predictor set for faster sampling
 bayes_vars <- c("outcome", "draft_pick", "avg_ppg", "avg_rpg",
                 "avg_apg", "avg_min_pg", "avg_fg_pct")
@@ -468,17 +486,19 @@ X_test_s  <- scale(X_test,
 K <- nlevels(train_b$outcome)   # 4 classes
 y_train <- as.integer(train_b$outcome)
 
-stan_data <- list(
-  N  = nrow(X_train_s),
-  K  = K,
-  P  = ncol(X_train_s),
-  X  = X_train_s,
-  y  = y_train,
-  N_test = nrow(X_test_s),
-  X_test = X_test_s
-)
+stan_cache <- "models/bayes_fit.rds"
+if (!file.exists(stan_cache)) {
+  stan_data <- list(
+    N      = nrow(X_train_s),
+    K      = K,
+    P      = ncol(X_train_s),
+    X      = X_train_s,
+    y      = y_train,
+    N_test = nrow(X_test_s),
+    X_test = X_test_s
+  )
 
-stan_code <- "
+  stan_code <- "
 data {
   int<lower=1> N;
   int<lower=2> K;
@@ -518,15 +538,19 @@ generated quantities {
 }
 "
 
-bayes_fit <- stan(
-  model_code = stan_code,
-  data       = stan_data,
-  chains     = 4,
-  iter       = 2000,
-  warmup     = 1000,
-  seed       = 42,
-  refresh    = 0
-)
+  bayes_fit <- stan(
+    model_code = stan_code,
+    data       = stan_data,
+    chains     = 4,
+    iter       = 2000,
+    warmup     = 1000,
+    seed       = 42,
+    refresh    = 0
+  )
+  saveRDS(bayes_fit, stan_cache)
+} else {
+  bayes_fit <- readRDS(stan_cache)
+}
 ```
 
 ```{r bayes-diagnostics}
@@ -591,12 +615,17 @@ beta_draws  <- extract(bayes_fit, pars = "beta")$beta      # [S, K-1, P]
 S <- nrow(alpha_draws)
 
 profile_probs <- lapply(1:nrow(profiles_s), function(i) {
-  x_i <- profiles_s[i, ]
-  log_lik_mat <- cbind(0, sweep(
-    matrix(beta_draws %*% x_i, nrow = S, ncol = K - 1),
-    2, alpha_draws, "+"
-  ))
-  probs <- t(apply(log_lik_mat, 1, function(row) exp(row) / sum(exp(row))))
+  x_i <- as.numeric(profiles_s[i, ])
+  # beta_draws is [S, K-1, P]; compute linear predictor for each class per draw
+  lin_pred <- matrix(0, nrow = S, ncol = K - 1)
+  for (k in seq_len(K - 1)) {
+    lin_pred[, k] <- alpha_draws[, k] + beta_draws[, k, ] %*% x_i
+  }
+  log_lik_mat <- cbind(0, lin_pred)   # [S, K], reference class score = 0
+  probs <- t(apply(log_lik_mat, 1, function(row) {
+    e <- exp(row - max(row))           # numerically stable softmax
+    e / sum(e)
+  }))
   data.frame(
     profile = ifelse(i == 1, "Lottery Pick (5th, ~16 PPG)", "Late 2nd Round (55th, ~7 PPG)"),
     outcome = outcome_levels,
@@ -630,13 +659,19 @@ profile_probs |>
 The outcome tiers are ordered (Out of League < Role Player < Starter < All-Star), so ordinal logistic regression is a natural complement — it exploits that structure for more efficient estimates and tests whether a single latent continuum explains the outcomes.
 
 ```{r polr-fit}
-polr_fit <- polr(
-  outcome ~ draft_pick + avg_ppg + avg_rpg + avg_apg + avg_spg + avg_bpg +
-    avg_fg_pct + avg_fg3_pct + avg_ft_pct + avg_min_pg + n_seasons,
-  data   = train_data,
-  method = "logistic",
-  Hess   = TRUE
-)
+polr_cache <- "models/polr_fit.rds"
+if (!file.exists(polr_cache)) {
+  polr_fit <- polr(
+    outcome ~ draft_pick + avg_ppg + avg_rpg + avg_apg + avg_spg + avg_bpg +
+      avg_fg_pct + avg_fg3_pct + avg_ft_pct + avg_min_pg + n_seasons,
+    data   = train_data,
+    method = "logistic",
+    Hess   = TRUE
+  )
+  saveRDS(polr_fit, polr_cache)
+} else {
+  polr_fit <- readRDS(polr_cache)
+}
 summary(polr_fit)
 ```
 
@@ -657,6 +692,7 @@ print(polr_cm$table)
 ---
 
 ### Model Comparison
+
 
 ```{r model-comparison}
 # Helper: macro-averaged F1
@@ -683,3 +719,4 @@ comparison <- data.frame(
 )
 
 kable(comparison, caption = "Test-set performance across all models")
+```
