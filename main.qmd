@@ -9,6 +9,15 @@ library(ggplot2)
 library(dplyr)
 library(tidyr)
 library(purrr)
+library(nnet)
+library(ranger)
+library(MASS)
+library(rstan)
+library(bayesplot)
+library(caret)
+library(knitr)
+rstan_options(auto_write = TRUE)
+options(mc.cores = parallel::detectCores())
 ```
 
 ## Project Overview
@@ -283,3 +292,394 @@ ggplot(traj_data, aes(x = year_in_league, y = ppg,
   theme_minimal(base_size = 13) +
   theme(legend.position = "right")
 ```
+
+---
+
+## Modeling
+
+### Train/Test Split
+
+```{r split}
+set.seed(42)
+model_data_clean <- model_data |>
+  select(outcome, draft_pick, avg_ppg, avg_rpg, avg_apg, avg_spg, avg_bpg,
+         avg_fg_pct, avg_fg3_pct, avg_ft_pct, avg_min_pg, n_seasons) |>
+  na.omit()
+
+train_idx  <- createDataPartition(model_data_clean$outcome, p = 0.8, list = FALSE)
+train_data <- model_data_clean[train_idx, ]
+test_data  <- model_data_clean[-train_idx, ]
+
+cat("Train:", nrow(train_data), " | Test:", nrow(test_data), "\n")
+table(train_data$outcome)
+```
+
+---
+
+### Model 1: Multinomial Logistic Regression
+
+```{r multinom-fit, message=FALSE, warning=FALSE}
+set.seed(42)
+mlr_fit <- multinom(
+  outcome ~ draft_pick + avg_ppg + avg_rpg + avg_apg + avg_spg + avg_bpg +
+    avg_fg_pct + avg_fg3_pct + avg_ft_pct + avg_min_pg + n_seasons,
+  data  = train_data,
+  trace = FALSE,
+  maxit = 500
+)
+summary(mlr_fit)
+```
+
+```{r multinom-bootstrap, cache=TRUE}
+# Bootstrap 95% CIs on coefficients (500 resamples)
+set.seed(42)
+B <- 500
+boot_coefs <- replicate(B, {
+  idx  <- sample(nrow(train_data), replace = TRUE)
+  fit  <- multinom(
+    outcome ~ draft_pick + avg_ppg + avg_rpg + avg_apg + avg_spg + avg_bpg +
+      avg_fg_pct + avg_fg3_pct + avg_ft_pct + avg_min_pg + n_seasons,
+    data  = train_data[idx, ],
+    trace = FALSE, maxit = 500
+  )
+  coef(fit)
+}, simplify = FALSE)
+
+# Combine into array and compute CIs
+boot_array <- simplify2array(boot_coefs)   # [classes, predictors, B]
+ci_lower <- apply(boot_array, c(1, 2), quantile, 0.025)
+ci_upper <- apply(boot_array, c(1, 2), quantile, 0.975)
+
+# Tidy coefficient table for display
+coef_df <- as.data.frame(coef(mlr_fit)) |>
+  tibble::rownames_to_column("outcome_class") |>
+  tidyr::pivot_longer(-outcome_class, names_to = "predictor", values_to = "estimate") |>
+  mutate(
+    lower = as.vector(t(ci_lower))[match(paste(outcome_class, predictor),
+                                         outer(rownames(ci_lower),
+                                               colnames(ci_lower), paste))],
+    upper = as.vector(t(ci_upper))[match(paste(outcome_class, predictor),
+                                         outer(rownames(ci_upper),
+                                               colnames(ci_upper), paste))]
+  )
+```
+
+```{r multinom-eval}
+mlr_pred <- predict(mlr_fit, newdata = test_data)
+mlr_cm   <- confusionMatrix(mlr_pred, test_data$outcome)
+cat("Multinomial LR — Test Accuracy:", round(mlr_cm$overall["Accuracy"], 3), "\n")
+print(mlr_cm$table)
+```
+
+```{r multinom-coef-plot, fig.width=10, fig.height=5}
+# Show coefficients for key predictors across outcome classes
+key_preds <- c("avg_ppg", "avg_min_pg", "draft_pick", "avg_rpg", "avg_apg")
+
+coef(mlr_fit) |>
+  as.data.frame() |>
+  tibble::rownames_to_column("outcome_class") |>
+  tidyr::pivot_longer(-outcome_class, names_to = "predictor", values_to = "estimate") |>
+  filter(predictor %in% key_preds) |>
+  ggplot(aes(x = predictor, y = estimate, fill = outcome_class)) +
+  geom_col(position = "dodge") +
+  scale_fill_manual(values = c(
+    "Role Player" = "#fc8d59", "Starter" = "#4575b4", "All-Star" = "#1a9850"
+  )) +
+  labs(title = "Multinomial LR Coefficients (vs. Out of League baseline)",
+       x = NULL, y = "Coefficient", fill = "Class") +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "bottom")
+```
+
+---
+
+### Model 2: Random Forest
+
+```{r rf-fit, cache=TRUE}
+set.seed(42)
+p <- ncol(train_data) - 1   # number of predictors
+
+# Simple CV to choose mtry
+mtry_candidates <- c(floor(sqrt(p)), floor(p / 3))
+cv_oob <- sapply(mtry_candidates, function(m) {
+  ranger(
+    outcome ~ ., data = train_data,
+    num.trees = 500, mtry = m,
+    importance = "impurity", seed = 42
+  )$prediction.error
+})
+
+best_mtry <- mtry_candidates[which.min(cv_oob)]
+cat("Best mtry:", best_mtry, " | OOB errors:", round(cv_oob, 3), "\n")
+
+rf_fit <- ranger(
+  outcome ~ ., data = train_data,
+  num.trees = 500, mtry = best_mtry,
+  importance = "impurity", seed = 42,
+  probability = FALSE
+)
+
+cat("OOB error rate:", round(rf_fit$prediction.error, 3), "\n")
+```
+
+```{r rf-eval}
+rf_pred <- predict(rf_fit, data = test_data)$predictions
+rf_cm   <- confusionMatrix(rf_pred, test_data$outcome)
+cat("Random Forest — Test Accuracy:", round(rf_cm$overall["Accuracy"], 3), "\n")
+print(rf_cm$table)
+```
+
+```{r rf-varimp, fig.width=8, fig.height=5}
+vimp <- sort(rf_fit$variable.importance, decreasing = TRUE)
+
+data.frame(predictor = names(vimp), importance = vimp) |>
+  ggplot(aes(x = reorder(predictor, importance), y = importance)) +
+  geom_col(fill = "#4575b4", alpha = 0.85) +
+  coord_flip() +
+  labs(title = "Random Forest Variable Importance",
+       subtitle = "Mean decrease in Gini impurity",
+       x = NULL, y = "Importance") +
+  theme_minimal(base_size = 13)
+```
+
+---
+
+### Model 3: Bayesian Multinomial Logistic Regression
+
+```{r stan-model, cache=TRUE, results="hide", message=FALSE, warning=FALSE}
+# Reduced predictor set for faster sampling
+bayes_vars <- c("outcome", "draft_pick", "avg_ppg", "avg_rpg",
+                "avg_apg", "avg_min_pg", "avg_fg_pct")
+
+train_b <- train_data[, bayes_vars]
+test_b  <- test_data[,  bayes_vars]
+
+# Design matrices (no intercept column; Stan adds it)
+X_train <- model.matrix(outcome ~ . - 1, data = train_b)
+X_test  <- model.matrix(outcome ~ . - 1, data = test_b)
+
+# Scale predictors
+X_scale <- scale(X_train)
+X_train_s <- as.matrix(X_scale)
+X_test_s  <- scale(X_test,
+                   center = attr(X_scale, "scaled:center"),
+                   scale  = attr(X_scale, "scaled:scale"))
+
+K <- nlevels(train_b$outcome)   # 4 classes
+y_train <- as.integer(train_b$outcome)
+
+stan_data <- list(
+  N  = nrow(X_train_s),
+  K  = K,
+  P  = ncol(X_train_s),
+  X  = X_train_s,
+  y  = y_train,
+  N_test = nrow(X_test_s),
+  X_test = X_test_s
+)
+
+stan_code <- "
+data {
+  int<lower=1> N;
+  int<lower=2> K;
+  int<lower=1> P;
+  matrix[N, P] X;
+  array[N] int<lower=1, upper=K> y;
+  int<lower=1> N_test;
+  matrix[N_test, P] X_test;
+}
+parameters {
+  matrix[K-1, P] beta;       // coefficients (K-1 classes vs reference)
+  vector[K-1]    alpha;      // intercepts
+}
+model {
+  to_vector(beta) ~ normal(0, 2.5);
+  alpha           ~ normal(0, 2.5);
+  {
+    matrix[N, K] log_lik;
+    log_lik[, 1] = rep_vector(0, N);
+    for (k in 2:K)
+      log_lik[, k] = alpha[k-1] + X * beta[k-1]';
+    for (n in 1:N)
+      target += log_softmax(log_lik[n]')[y[n]];
+  }
+}
+generated quantities {
+  // Posterior class probabilities for test observations
+  matrix[N_test, K] prob_test;
+  {
+    matrix[N_test, K] log_lik_test;
+    log_lik_test[, 1] = rep_vector(0, N_test);
+    for (k in 2:K)
+      log_lik_test[, k] = alpha[k-1] + X_test * beta[k-1]';
+    for (n in 1:N_test)
+      prob_test[n] = softmax(log_lik_test[n]')';
+  }
+}
+"
+
+bayes_fit <- stan(
+  model_code = stan_code,
+  data       = stan_data,
+  chains     = 4,
+  iter       = 2000,
+  warmup     = 1000,
+  seed       = 42,
+  refresh    = 0
+)
+```
+
+```{r bayes-diagnostics}
+# R-hat check
+rhat_vals <- summary(bayes_fit)$summary[, "Rhat"]
+cat("Max R-hat:", round(max(rhat_vals, na.rm = TRUE), 3), "\n")
+cat("Parameters with R-hat > 1.05:", sum(rhat_vals > 1.05, na.rm = TRUE), "\n")
+```
+
+```{r bayes-coef-plot, fig.width=9, fig.height=5}
+outcome_levels <- levels(train_b$outcome)
+pred_names     <- colnames(X_train_s)
+
+# Extract beta draws and plot 90% credible intervals
+posterior_draws <- as.array(bayes_fit, pars = "beta")
+
+# Rename dimensions for bayesplot
+dimnames(posterior_draws)[[3]] <- paste0(
+  "beta[",
+  rep(outcome_levels[-1], each = length(pred_names)),
+  ", ", rep(pred_names, times = K - 1), "]"
+)
+
+mcmc_intervals(posterior_draws, prob = 0.9, prob_outer = 0.95) +
+  labs(title = "Bayesian MLR: 90% Posterior Credible Intervals",
+       subtitle = "Coefficients for each outcome class vs. Out of League baseline") +
+  theme_minimal(base_size = 12)
+```
+
+```{r bayes-pred}
+# Posterior mean class probabilities on test set → point prediction
+prob_test_draws <- extract(bayes_fit, pars = "prob_test")$prob_test
+prob_test_mean  <- apply(prob_test_draws, c(2, 3), mean)
+bayes_pred_idx  <- apply(prob_test_mean, 1, which.max)
+bayes_pred      <- factor(outcome_levels[bayes_pred_idx], levels = outcome_levels)
+
+bayes_cm <- confusionMatrix(bayes_pred, test_b$outcome)
+cat("Bayesian MLR — Test Accuracy:", round(bayes_cm$overall["Accuracy"], 3), "\n")
+print(bayes_cm$table)
+```
+
+```{r bayes-profiles, fig.width=9, fig.height=4}
+# Posterior class probabilities for two illustrative player profiles:
+# Profile A: lottery pick (pick 5), high early production
+# Profile B: late second round (pick 55), modest production
+profiles <- data.frame(
+  draft_pick  = c(5,   55),
+  avg_ppg     = c(16,   7),
+  avg_rpg     = c(5,    3),
+  avg_apg     = c(4,    2),
+  avg_min_pg  = c(30,  15),
+  avg_fg_pct  = c(0.46, 0.42)
+)
+
+profiles_s <- scale(profiles,
+                    center = attr(X_scale, "scaled:center"),
+                    scale  = attr(X_scale, "scaled:scale"))
+
+# Re-use posterior draws of alpha and beta to get profile probabilities
+alpha_draws <- extract(bayes_fit, pars = "alpha")$alpha   # [S, K-1]
+beta_draws  <- extract(bayes_fit, pars = "beta")$beta      # [S, K-1, P]
+S <- nrow(alpha_draws)
+
+profile_probs <- lapply(1:nrow(profiles_s), function(i) {
+  x_i <- profiles_s[i, ]
+  log_lik_mat <- cbind(0, sweep(
+    matrix(beta_draws %*% x_i, nrow = S, ncol = K - 1),
+    2, alpha_draws, "+"
+  ))
+  probs <- t(apply(log_lik_mat, 1, function(row) exp(row) / sum(exp(row))))
+  data.frame(
+    profile = ifelse(i == 1, "Lottery Pick (5th, ~16 PPG)", "Late 2nd Round (55th, ~7 PPG)"),
+    outcome = outcome_levels,
+    mean    = colMeans(probs),
+    lower   = apply(probs, 2, quantile, 0.05),
+    upper   = apply(probs, 2, quantile, 0.95)
+  )
+}) |> bind_rows()
+
+profile_probs |>
+  mutate(outcome = factor(outcome, levels = outcome_levels)) |>
+  ggplot(aes(x = outcome, y = mean, fill = outcome)) +
+  geom_col(alpha = 0.8) +
+  geom_errorbar(aes(ymin = lower, ymax = upper), width = 0.25) +
+  facet_wrap(~profile) +
+  scale_fill_manual(values = c(
+    "Out of League" = "#d73027", "Role Player" = "#fc8d59",
+    "Starter" = "#4575b4", "All-Star" = "#1a9850"
+  )) +
+  labs(title = "Posterior Class Probabilities for Illustrative Player Profiles",
+       subtitle = "Bars = posterior mean; error bars = 90% credible interval",
+       x = NULL, y = "Probability") +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "none", axis.text.x = element_text(angle = 20, hjust = 1))
+```
+
+---
+
+### Model 4: Ordinal Logistic Regression
+
+The outcome tiers are ordered (Out of League < Role Player < Starter < All-Star), so ordinal logistic regression is a natural complement — it exploits that structure for more efficient estimates and tests whether a single latent continuum explains the outcomes.
+
+```{r polr-fit}
+polr_fit <- polr(
+  outcome ~ draft_pick + avg_ppg + avg_rpg + avg_apg + avg_spg + avg_bpg +
+    avg_fg_pct + avg_fg3_pct + avg_ft_pct + avg_min_pg + n_seasons,
+  data   = train_data,
+  method = "logistic",
+  Hess   = TRUE
+)
+summary(polr_fit)
+```
+
+```{r polr-ci}
+polr_ci <- confint(polr_fit)   # profile-likelihood 95% CIs
+kable(round(cbind(coef(polr_fit), polr_ci), 3),
+      col.names = c("Estimate", "2.5%", "97.5%"),
+      caption   = "Ordinal LR Coefficients with 95% Profile-Likelihood CIs")
+```
+
+```{r polr-eval}
+polr_pred <- predict(polr_fit, newdata = test_data)
+polr_cm   <- confusionMatrix(polr_pred, test_data$outcome)
+cat("Ordinal LR — Test Accuracy:", round(polr_cm$overall["Accuracy"], 3), "\n")
+print(polr_cm$table)
+```
+
+---
+
+### Model Comparison
+
+```{r model-comparison}
+# Helper: macro-averaged F1
+macro_f1 <- function(cm) {
+  per_class <- cm$byClass[, "F1"]
+  mean(per_class, na.rm = TRUE)
+}
+
+comparison <- data.frame(
+  Model    = c("Multinomial LR", "Random Forest",
+               "Bayesian MLR", "Ordinal LR"),
+  Accuracy = c(
+    round(mlr_cm$overall["Accuracy"],   3),
+    round(rf_cm$overall["Accuracy"],    3),
+    round(bayes_cm$overall["Accuracy"], 3),
+    round(polr_cm$overall["Accuracy"],  3)
+  ),
+  Macro_F1 = c(
+    round(macro_f1(mlr_cm),   3),
+    round(macro_f1(rf_cm),    3),
+    round(macro_f1(bayes_cm), 3),
+    round(macro_f1(polr_cm),  3)
+  )
+)
+
+kable(comparison, caption = "Test-set performance across all models")
