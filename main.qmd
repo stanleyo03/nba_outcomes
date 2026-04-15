@@ -1,722 +1,114 @@
 ---
-title: "NBA Career Outcomes Prediction"
-format: html
+title: "Why Do High NBA Draft Picks Flop?"
+author:
+  - "Jiwon Park"
+  - "Stanley Ouyang"
+  - "Andy Ouyang"
+date: "2026-04-15"
+format:
+  pdf:
+    number-sections: true
+    geometry: margin=1in
+execute:
+  echo: false
+  warning: false
+  message: false
 ---
 
-```{r setup, message=FALSE, warning=FALSE}
-library(hoopR)
-library(ggplot2)
-library(dplyr)
-library(tidyr)
-library(purrr)
-library(nnet)
-library(ranger)
-library(MASS)
-library(rstan)
-library(bayesplot)
-library(caret)
-library(knitr)
-rstan_options(auto_write = TRUE)
-options(mc.cores = parallel::detectCores())
-```
-
-## Project Overview
-
-Given a player's first few seasons in the NBA, predict their career outcome tier:
-
-- **Out of League**: washed out quickly, minimal career MPG
-- **Role Player**: bench contributor, 10–20 MPG
-- **Starter**: regular starter, 20+ MPG sustained
-- **All-Star**: ≥1 All-Star selection
-
-We will use multinomial logistic regression and random forest models with features derived from players' first 1–3 seasons.
-
----
-
-## Data Collection
-
-Pull league-wide per-season stats using `hoopR::nba_leaguedashplayerstats()` for seasons 2000–2015. Cache to disk to avoid re-scraping.
-
-```{r load-season-stats, message=FALSE, warning=FALSE}
-seasons <- 2000:2015
-cache_file <- "data/season_stats.rds"
-
-if (!file.exists(cache_file)) {
-  dir.create("data", showWarnings = FALSE)
-  season_stats_raw <- map_dfr(seasons, function(yr) {
-    Sys.sleep(0.6)  # be polite to the API
-    tryCatch(
-      nba_leaguedashplayerstats(season = year_to_season(yr)) |>
-        pluck("LeagueDashPlayerStats") |>
-        mutate(season = yr),
-      error = function(e) NULL
-    )
-  })
-  saveRDS(season_stats_raw, cache_file)
-} else {
-  season_stats_raw <- readRDS(cache_file)
-}
-```
-
-```{r clean-stats}
-season_stats <- season_stats_raw |>
-  transmute(
-    player_id  = as.integer(PLAYER_ID),
-    player     = PLAYER_NAME,
-    season     = season,
-    gp         = as.numeric(GP),
-    min_pg     = as.numeric(MIN),
-    ppg        = as.numeric(PTS),
-    rpg        = as.numeric(REB),
-    apg        = as.numeric(AST),
-    spg        = as.numeric(STL),
-    bpg        = as.numeric(BLK),
-    fg_pct     = as.numeric(FG_PCT),
-    fg3_pct    = as.numeric(FG3_PCT),
-    ft_pct     = as.numeric(FT_PCT),
-    age        = as.numeric(AGE)
-  ) |>
-  filter(gp >= 10)  # drop injury-shortened stints
-```
-
-## Career Outcome Labels
-
-Label each player by their peak career tier. Pull each player's full career stats once, then classify.
-
-```{r career-labels, message=FALSE, warning=FALSE}
-all_star_cache <- "data/allstar_playerids.rds"
-
-if (!file.exists(all_star_cache)) {
-  # All-Star rosters are available via nba_allstarballotpredictor or
-  # we approximate using seasons where a player averaged 20+ PPG and 3+ ASG appearances.
-  # Use nba_leaguedashplayerstats filtered to All-Star seasons (2000-2015) as a proxy:
-  # Players who appeared in the top scoring tier consistently are labeled All-Star.
-  # For a cleaner label, pull each player's career accolades via nba_playercareerstats.
-  player_ids <- unique(season_stats$player_id)
-
-  career_raw <- map(player_ids, function(pid) {
-    Sys.sleep(0.4)
-    tryCatch({
-      res <- nba_playercareerstats(player_id = pid)
-      list(
-        totals  = res |> pluck("CareerTotalsRegularSeason"),
-        seasons = res |> pluck("SeasonTotalsRegularSeason")
-      )
-    }, error = function(e) NULL)
-  })
-
-  saveRDS(career_raw, all_star_cache)
-} else {
-  career_raw <- readRDS(all_star_cache)
-}
-
-# Cache was saved as a flat list of CareerTotalsRegularSeason data frames
-# with a lowercase player_id column already attached
-career_totals <- career_raw |>
-  compact() |>
-  bind_rows() |>
-  transmute(
-    player_id  = as.integer(player_id),
-    career_gp  = as.numeric(GP),
-    career_min = as.numeric(MIN),
-    career_ppg = as.numeric(PTS) / as.numeric(GP),
-    career_mpg = as.numeric(MIN) / as.numeric(GP),
-    # Approximate seasons from observed season stats (no season-by-season data in cache)
-    career_seasons = career_gp / 55
-  )
-
-# All-Star approximation: players with career PPG > 18 and 10+ seasons → All-Star
-# Starter: career MPG >= 28 | PPG >= 14
-# Role Player: career MPG 15–28 and career_seasons >= 4
-# Out of League: everything else (short careers, low minutes)
-player_labels <- career_totals |>
-  mutate(
-    outcome = case_when(
-      career_ppg >= 18 & career_seasons >= 8             ~ "All-Star",
-      career_mpg >= 28 | (career_ppg >= 14 & career_seasons >= 6) ~ "Starter",
-      career_mpg >= 15 & career_seasons >= 4              ~ "Role Player",
-      TRUE                                                 ~ "Out of League"
-    ),
-    outcome = factor(outcome,
-                     levels = c("Out of League", "Role Player", "Starter", "All-Star"))
-  ) |>
-  dplyr::select(player_id, outcome, career_ppg, career_mpg, career_seasons)
-```
-
-```{r join-draft}
-# Pull draft info for each player
-draft_cache <- "data/draft_info.rds"
-
-if (!file.exists(draft_cache)) {
-  draft_raw <- map(unique(season_stats$player_id), function(pid) {
-    Sys.sleep(0.003)
-    tryCatch(
-      nba_commonplayerinfo(player_id = pid) |>
-        pluck("CommonPlayerInfo") |>
-        mutate(player_id = pid),
-      error = function(e) NULL
-    )
-  })
-  saveRDS(draft_raw, draft_cache)
-} else {
-  draft_raw <- readRDS(draft_cache)
-}
-
-draft_info <- draft_raw |>
-  compact() |>
-  bind_rows() |>
-  transmute(
-    player_id  = as.integer(player_id),
-    draft_pick = suppressWarnings(as.numeric(DRAFT_NUMBER))
-  ) |>
-  filter(!is.na(draft_pick))
-```
-
-```{r build-model-data}
-# Identify each player's debut season, then keep their first 3 seasons
-debut_season <- season_stats |>
-  group_by(player_id) |>
-  summarise(debut = min(season), .groups = "drop")
-
-first3 <- season_stats |>
-  left_join(debut_season, by = "player_id") |>
-  filter(season <= debut + 2) |>
-  group_by(player_id) |>
-  summarise(
-    across(c(ppg, rpg, apg, spg, bpg, fg_pct, fg3_pct, ft_pct, min_pg),
-           mean, na.rm = TRUE, .names = "avg_{.col}"),
-    n_seasons = n(),
-    .groups = "drop"
-  )
-
-model_data <- first3 |>
-  inner_join(player_labels, by = "player_id") |>
-  inner_join(draft_info,   by = "player_id") |>
-  filter(n_seasons >= 1)
-
-glimpse(model_data)
-```
-
----
-
-## Exploratory Visualizations
-
-### Visualization 1: Draft Position by Career Outcome
-
-```{r viz1-draft, fig.width=8, fig.height=5}
-model_data |>
-  filter(draft_pick <= 60) |>
-  ggplot(aes(x = outcome, y = draft_pick, fill = outcome)) +
-  geom_violin(alpha = 0.4, color = NA) +
-  geom_boxplot(width = 0.2, outlier.shape = NA, alpha = 0.8) +
-  geom_jitter(width = 0.12, size = 1.5, alpha = 0.4, color = "gray30") +
-  scale_y_reverse(breaks = c(1, 10, 20, 30, 45, 60)) +
-  scale_fill_manual(values = c(
-    "Out of League" = "#d73027",
-    "Role Player"   = "#fc8d59",
-    "Starter"       = "#4575b4",
-    "All-Star"      = "#1a9850"
-  )) +
-  labs(
-    title    = "Draft Position by Career Outcome",
-    subtitle = "Lower pick number = higher draft position  |  2000–2015 draft classes",
-    x = "Career Outcome", y = "Draft Pick Number"
-  ) +
-  theme_minimal(base_size = 13) +
-  theme(legend.position = "none")
-```
-
-### Visualization 2: PPG in First 3 Seasons by Career Outcome
-
-```{r viz2-ppg, fig.width=8, fig.height=5}
-model_data |>
-  ggplot(aes(x = avg_ppg, fill = outcome, color = outcome)) +
-  geom_density(alpha = 0.35, linewidth = 0.8) +
-  scale_fill_manual(values = c(
-    "Out of League" = "#d73027",
-    "Role Player"   = "#fc8d59",
-    "Starter"       = "#4575b4",
-    "All-Star"      = "#1a9850"
-  )) +
-  scale_color_manual(values = c(
-    "Out of League" = "#d73027",
-    "Role Player"   = "#fc8d59",
-    "Starter"       = "#4575b4",
-    "All-Star"      = "#1a9850"
-  )) +
-  labs(
-    title    = "PPG Distribution (First 3 Seasons) by Career Outcome",
-    subtitle = "Average over each player's first 1–3 seasons",
-    x = "Points Per Game", y = "Density",
-    fill = "Outcome", color = "Outcome"
-  ) +
-  theme_minimal(base_size = 13) +
-  theme(legend.position = "bottom")
-```
-
-### Visualization 3: Career Scoring Trajectory by Outcome Tier
-
-```{r viz3-trajectories, fig.width=9, fig.height=5, message=FALSE, warning=FALSE}
-# For a random sample of players per tier, show their season PPG over first 3 years
-set.seed(42)
-sampled_ids <- model_data |>
-  group_by(outcome) |>
-  slice_sample(n = 10) |>
-  pull(player_id)
-
-traj_data <- season_stats |>
-  inner_join(debut_season, by = "player_id") |>
-  filter(player_id %in% sampled_ids, season <= debut + 2) |>
-  mutate(year_in_league = season - debut + 1) |>
-  inner_join(dplyr::select(player_labels, player_id, outcome), by = "player_id")
-
-ggplot(traj_data, aes(x = year_in_league, y = ppg,
-                       group = player_id, color = outcome)) +
-  geom_line(alpha = 0.4, linewidth = 0.8) +
-  geom_point(alpha = 0.6, size = 2) +
-  stat_summary(aes(group = outcome), fun = mean,
-               geom = "line", linewidth = 2, linetype = "dashed") +
-  scale_color_manual(values = c(
-    "Out of League" = "#d73027",
-    "Role Player"   = "#fc8d59",
-    "Starter"       = "#4575b4",
-    "All-Star"      = "#1a9850"
-  )) +
-  scale_x_continuous(breaks = 1:3, labels = c("Year 1", "Year 2", "Year 3")) +
-  labs(
-    title    = "Scoring Trajectory in First 3 Seasons by Career Outcome",
-    subtitle = "Thin = individual players (sample of 10/tier)  |  Dashed = tier average",
-    x = "Season in League", y = "Points Per Game",
-    color = "Outcome"
-  ) +
-  theme_minimal(base_size = 13) +
-  theme(legend.position = "right")
-```
-
----
-
-## Modeling
-
-### Train/Test Split
-
-```{r split}
-set.seed(42)
-model_data_clean <- model_data |>
-  dplyr::select(outcome, draft_pick, avg_ppg, avg_rpg, avg_apg, avg_spg, avg_bpg,
-         avg_fg_pct, avg_fg3_pct, avg_ft_pct, avg_min_pg, n_seasons) |>
-  na.omit()
-
-train_idx  <- createDataPartition(model_data_clean$outcome, p = 0.8, list = FALSE)
-train_data <- model_data_clean[train_idx, ]
-test_data  <- model_data_clean[-train_idx, ]
-
-cat("Train:", nrow(train_data), " | Test:", nrow(test_data), "\n")
-table(train_data$outcome)
-```
-
----
-
-### Model 1: Multinomial Logistic Regression
-
-```{r multinom-fit, message=FALSE, warning=FALSE}
-mlr_cache <- "models/mlr_fit.rds"
-if (!file.exists(mlr_cache)) {
-  set.seed(42)
-  mlr_fit <- multinom(
-    outcome ~ draft_pick + avg_ppg + avg_rpg + avg_apg + avg_spg + avg_bpg +
-      avg_fg_pct + avg_fg3_pct + avg_ft_pct + avg_min_pg + n_seasons,
-    data  = train_data,
-    trace = FALSE,
-    maxit = 500
-  )
-  saveRDS(mlr_fit, mlr_cache)
-} else {
-  mlr_fit <- readRDS(mlr_cache)
-}
-summary(mlr_fit)
-```
-
-```{r multinom-bootstrap}
-boot_cache <- "models/mlr_boot.rds"
-if (!file.exists(boot_cache)) {
-  # Bootstrap 95% CIs on coefficients (500 resamples)
-  set.seed(42)
-  B <- 500
-  boot_coefs <- replicate(B, {
-    idx  <- sample(nrow(train_data), replace = TRUE)
-    fit  <- multinom(
-      outcome ~ draft_pick + avg_ppg + avg_rpg + avg_apg + avg_spg + avg_bpg +
-        avg_fg_pct + avg_fg3_pct + avg_ft_pct + avg_min_pg + n_seasons,
-      data  = train_data[idx, ],
-      trace = FALSE, maxit = 500
-    )
-    coef(fit)
-  }, simplify = FALSE)
-  saveRDS(boot_coefs, boot_cache)
-} else {
-  boot_coefs <- readRDS(boot_cache)
-}
-
-# Combine into array and compute CIs
-boot_array <- simplify2array(boot_coefs)   # [classes, predictors, B]
-ci_lower <- apply(boot_array, c(1, 2), quantile, 0.025)
-ci_upper <- apply(boot_array, c(1, 2), quantile, 0.975)
-
-# Tidy coefficient table for display
-coef_df <- as.data.frame(coef(mlr_fit)) |>
-  tibble::rownames_to_column("outcome_class") |>
-  tidyr::pivot_longer(-outcome_class, names_to = "predictor", values_to = "estimate") |>
-  mutate(
-    lower = as.vector(t(ci_lower))[match(paste(outcome_class, predictor),
-                                         outer(rownames(ci_lower),
-                                               colnames(ci_lower), paste))],
-    upper = as.vector(t(ci_upper))[match(paste(outcome_class, predictor),
-                                         outer(rownames(ci_upper),
-                                               colnames(ci_upper), paste))]
-  )
-```
-
-```{r multinom-eval}
-mlr_pred <- predict(mlr_fit, newdata = test_data)
-mlr_cm   <- confusionMatrix(mlr_pred, test_data$outcome)
-cat("Multinomial LR — Test Accuracy:", round(mlr_cm$overall["Accuracy"], 3), "\n")
-print(mlr_cm$table)
-```
-
-```{r multinom-coef-plot, fig.width=10, fig.height=5}
-# Show coefficients for key predictors across outcome classes
-key_preds <- c("avg_ppg", "avg_min_pg", "draft_pick", "avg_rpg", "avg_apg")
-
-coef(mlr_fit) |>
-  as.data.frame() |>
-  tibble::rownames_to_column("outcome_class") |>
-  tidyr::pivot_longer(-outcome_class, names_to = "predictor", values_to = "estimate") |>
-  filter(predictor %in% key_preds) |>
-  ggplot(aes(x = predictor, y = estimate, fill = outcome_class)) +
-  geom_col(position = "dodge") +
-  scale_fill_manual(values = c(
-    "Role Player" = "#fc8d59", "Starter" = "#4575b4", "All-Star" = "#1a9850"
-  )) +
-  labs(title = "Multinomial LR Coefficients (vs. Out of League baseline)",
-       x = NULL, y = "Coefficient", fill = "Class") +
-  theme_minimal(base_size = 13) +
-  theme(legend.position = "bottom")
-```
-
----
-
-### Model 2: Random Forest
-
-```{r rf-fit}
-rf_cache <- "models/rf_fit.rds"
-if (!file.exists(rf_cache)) {
-  set.seed(42)
-  p <- ncol(train_data) - 1   # number of predictors
-
-  # Simple CV to choose mtry
-  mtry_candidates <- c(floor(sqrt(p)), floor(p / 3))
-  cv_oob <- sapply(mtry_candidates, function(m) {
-    ranger(
-      outcome ~ ., data = train_data,
-      num.trees = 500, mtry = m,
-      importance = "impurity", seed = 42
-    )$prediction.error
-  })
-
-  best_mtry <- mtry_candidates[which.min(cv_oob)]
-  cat("Best mtry:", best_mtry, " | OOB errors:", round(cv_oob, 3), "\n")
-
-  rf_fit <- ranger(
-    outcome ~ ., data = train_data,
-    num.trees = 500, mtry = best_mtry,
-    importance = "impurity", seed = 42,
-    probability = FALSE
-  )
-  saveRDS(rf_fit, rf_cache)
-} else {
-  rf_fit <- readRDS(rf_cache)
-}
-
-cat("OOB error rate:", round(rf_fit$prediction.error, 3), "\n")
-```
-
-```{r rf-eval}
-rf_pred <- predict(rf_fit, data = test_data)$predictions
-rf_cm   <- confusionMatrix(rf_pred, test_data$outcome)
-cat("Random Forest — Test Accuracy:", round(rf_cm$overall["Accuracy"], 3), "\n")
-print(rf_cm$table)
-```
-
-```{r rf-varimp, fig.width=8, fig.height=5}
-vimp <- sort(rf_fit$variable.importance, decreasing = TRUE)
-
-data.frame(predictor = names(vimp), importance = vimp) |>
-  ggplot(aes(x = reorder(predictor, importance), y = importance)) +
-  geom_col(fill = "#4575b4", alpha = 0.85) +
-  coord_flip() +
-  labs(title = "Random Forest Variable Importance",
-       subtitle = "Mean decrease in Gini impurity",
-       x = NULL, y = "Importance") +
-  theme_minimal(base_size = 13)
-```
-
----
-
-### Model 3: Bayesian Multinomial Logistic Regression
-
-```{r stan-model, results="hide", message=FALSE, warning=FALSE}
-# Reduced predictor set for faster sampling
-bayes_vars <- c("outcome", "draft_pick", "avg_ppg", "avg_rpg",
-                "avg_apg", "avg_min_pg", "avg_fg_pct")
-
-train_b <- train_data[, bayes_vars]
-test_b  <- test_data[,  bayes_vars]
-
-# Design matrices (no intercept column; Stan adds it)
-X_train <- model.matrix(outcome ~ . - 1, data = train_b)
-X_test  <- model.matrix(outcome ~ . - 1, data = test_b)
-
-# Scale predictors
-X_scale <- scale(X_train)
-X_train_s <- as.matrix(X_scale)
-X_test_s  <- scale(X_test,
-                   center = attr(X_scale, "scaled:center"),
-                   scale  = attr(X_scale, "scaled:scale"))
-
-K <- nlevels(train_b$outcome)   # 4 classes
-y_train <- as.integer(train_b$outcome)
-
-stan_cache <- "models/bayes_fit.rds"
-if (!file.exists(stan_cache)) {
-  stan_data <- list(
-    N      = nrow(X_train_s),
-    K      = K,
-    P      = ncol(X_train_s),
-    X      = X_train_s,
-    y      = y_train,
-    N_test = nrow(X_test_s),
-    X_test = X_test_s
-  )
-
-  stan_code <- "
-data {
-  int<lower=1> N;
-  int<lower=2> K;
-  int<lower=1> P;
-  matrix[N, P] X;
-  array[N] int<lower=1, upper=K> y;
-  int<lower=1> N_test;
-  matrix[N_test, P] X_test;
-}
-parameters {
-  matrix[K-1, P] beta;       // coefficients (K-1 classes vs reference)
-  vector[K-1]    alpha;      // intercepts
-}
-model {
-  to_vector(beta) ~ normal(0, 2.5);
-  alpha           ~ normal(0, 2.5);
-  {
-    matrix[N, K] log_lik;
-    log_lik[, 1] = rep_vector(0, N);
-    for (k in 2:K)
-      log_lik[, k] = alpha[k-1] + X * beta[k-1]';
-    for (n in 1:N)
-      target += log_softmax(log_lik[n]')[y[n]];
-  }
-}
-generated quantities {
-  // Posterior class probabilities for test observations
-  matrix[N_test, K] prob_test;
-  {
-    matrix[N_test, K] log_lik_test;
-    log_lik_test[, 1] = rep_vector(0, N_test);
-    for (k in 2:K)
-      log_lik_test[, k] = alpha[k-1] + X_test * beta[k-1]';
-    for (n in 1:N_test)
-      prob_test[n] = softmax(log_lik_test[n]')';
-  }
-}
-"
-
-  bayes_fit <- stan(
-    model_code = stan_code,
-    data       = stan_data,
-    chains     = 4,
-    iter       = 2000,
-    warmup     = 1000,
-    seed       = 42,
-    refresh    = 0
-  )
-  saveRDS(bayes_fit, stan_cache)
-} else {
-  bayes_fit <- readRDS(stan_cache)
-}
-```
-
-```{r bayes-diagnostics}
-# R-hat check
-rhat_vals <- summary(bayes_fit)$summary[, "Rhat"]
-cat("Max R-hat:", round(max(rhat_vals, na.rm = TRUE), 3), "\n")
-cat("Parameters with R-hat > 1.05:", sum(rhat_vals > 1.05, na.rm = TRUE), "\n")
-```
-
-```{r bayes-coef-plot, fig.width=9, fig.height=5}
-outcome_levels <- levels(train_b$outcome)
-pred_names     <- colnames(X_train_s)
-
-# Extract beta draws and plot 90% credible intervals
-posterior_draws <- as.array(bayes_fit, pars = "beta")
-
-# Rename dimensions for bayesplot
-dimnames(posterior_draws)[[3]] <- paste0(
-  "beta[",
-  rep(outcome_levels[-1], each = length(pred_names)),
-  ", ", rep(pred_names, times = K - 1), "]"
-)
-
-mcmc_intervals(posterior_draws, prob = 0.9, prob_outer = 0.95) +
-  labs(title = "Bayesian MLR: 90% Posterior Credible Intervals",
-       subtitle = "Coefficients for each outcome class vs. Out of League baseline") +
-  theme_minimal(base_size = 12)
-```
-
-```{r bayes-pred}
-# Posterior mean class probabilities on test set → point prediction
-prob_test_draws <- extract(bayes_fit, pars = "prob_test")$prob_test
-prob_test_mean  <- apply(prob_test_draws, c(2, 3), mean)
-bayes_pred_idx  <- apply(prob_test_mean, 1, which.max)
-bayes_pred      <- factor(outcome_levels[bayes_pred_idx], levels = outcome_levels)
-
-bayes_cm <- confusionMatrix(bayes_pred, test_b$outcome)
-cat("Bayesian MLR — Test Accuracy:", round(bayes_cm$overall["Accuracy"], 3), "\n")
-print(bayes_cm$table)
-```
-
-```{r bayes-profiles, fig.width=9, fig.height=4}
-# Posterior class probabilities for two illustrative player profiles:
-# Profile A: lottery pick (pick 5), high early production
-# Profile B: late second round (pick 55), modest production
-profiles <- data.frame(
-  draft_pick  = c(5,   55),
-  avg_ppg     = c(16,   7),
-  avg_rpg     = c(5,    3),
-  avg_apg     = c(4,    2),
-  avg_min_pg  = c(30,  15),
-  avg_fg_pct  = c(0.46, 0.42)
-)
-
-profiles_s <- scale(profiles,
-                    center = attr(X_scale, "scaled:center"),
-                    scale  = attr(X_scale, "scaled:scale"))
-
-# Re-use posterior draws of alpha and beta to get profile probabilities
-alpha_draws <- extract(bayes_fit, pars = "alpha")$alpha   # [S, K-1]
-beta_draws  <- extract(bayes_fit, pars = "beta")$beta      # [S, K-1, P]
-S <- nrow(alpha_draws)
-
-profile_probs <- lapply(1:nrow(profiles_s), function(i) {
-  x_i <- as.numeric(profiles_s[i, ])
-  # beta_draws is [S, K-1, P]; compute linear predictor for each class per draw
-  lin_pred <- matrix(0, nrow = S, ncol = K - 1)
-  for (k in seq_len(K - 1)) {
-    lin_pred[, k] <- alpha_draws[, k] + beta_draws[, k, ] %*% x_i
-  }
-  log_lik_mat <- cbind(0, lin_pred)   # [S, K], reference class score = 0
-  probs <- t(apply(log_lik_mat, 1, function(row) {
-    e <- exp(row - max(row))           # numerically stable softmax
-    e / sum(e)
-  }))
-  data.frame(
-    profile = ifelse(i == 1, "Lottery Pick (5th, ~16 PPG)", "Late 2nd Round (55th, ~7 PPG)"),
-    outcome = outcome_levels,
-    mean    = colMeans(probs),
-    lower   = apply(probs, 2, quantile, 0.05),
-    upper   = apply(probs, 2, quantile, 0.95)
-  )
-}) |> bind_rows()
-
-profile_probs |>
-  mutate(outcome = factor(outcome, levels = outcome_levels)) |>
-  ggplot(aes(x = outcome, y = mean, fill = outcome)) +
-  geom_col(alpha = 0.8) +
-  geom_errorbar(aes(ymin = lower, ymax = upper), width = 0.25) +
-  facet_wrap(~profile) +
-  scale_fill_manual(values = c(
-    "Out of League" = "#d73027", "Role Player" = "#fc8d59",
-    "Starter" = "#4575b4", "All-Star" = "#1a9850"
-  )) +
-  labs(title = "Posterior Class Probabilities for Illustrative Player Profiles",
-       subtitle = "Bars = posterior mean; error bars = 90% credible interval",
-       x = NULL, y = "Probability") +
-  theme_minimal(base_size = 13) +
-  theme(legend.position = "none", axis.text.x = element_text(angle = 20, hjust = 1))
-```
-
----
-
-### Model 4: Ordinal Logistic Regression
-
-The outcome tiers are ordered (Out of League < Role Player < Starter < All-Star), so ordinal logistic regression is a natural complement — it exploits that structure for more efficient estimates and tests whether a single latent continuum explains the outcomes.
-
-```{r polr-fit}
-polr_cache <- "models/polr_fit.rds"
-if (!file.exists(polr_cache)) {
-  polr_fit <- polr(
-    outcome ~ draft_pick + avg_ppg + avg_rpg + avg_apg + avg_spg + avg_bpg +
-      avg_fg_pct + avg_fg3_pct + avg_ft_pct + avg_min_pg + n_seasons,
-    data   = train_data,
-    method = "logistic",
-    Hess   = TRUE
-  )
-  saveRDS(polr_fit, polr_cache)
-} else {
-  polr_fit <- readRDS(polr_cache)
-}
-summary(polr_fit)
-```
-
-```{r polr-ci}
-polr_ci <- confint(polr_fit)   # profile-likelihood 95% CIs
-kable(round(cbind(coef(polr_fit), polr_ci), 3),
-      col.names = c("Estimate", "2.5%", "97.5%"),
-      caption   = "Ordinal LR Coefficients with 95% Profile-Likelihood CIs")
-```
-
-```{r polr-eval}
-polr_pred <- predict(polr_fit, newdata = test_data)
-polr_cm   <- confusionMatrix(polr_pred, test_data$outcome)
-cat("Ordinal LR — Test Accuracy:", round(polr_cm$overall["Accuracy"], 3), "\n")
-print(polr_cm$table)
-```
-
----
-
-### Model Comparison
-
-
-```{r model-comparison}
-# Helper: macro-averaged F1
-macro_f1 <- function(cm) {
-  per_class <- cm$byClass[, "F1"]
-  mean(per_class, na.rm = TRUE)
-}
-
-comparison <- data.frame(
-  Model    = c("Multinomial LR", "Random Forest",
-               "Bayesian MLR", "Ordinal LR"),
-  Accuracy = c(
-    round(mlr_cm$overall["Accuracy"],   3),
-    round(rf_cm$overall["Accuracy"],    3),
-    round(bayes_cm$overall["Accuracy"], 3),
-    round(polr_cm$overall["Accuracy"],  3)
-  ),
-  Macro_F1 = c(
-    round(macro_f1(mlr_cm),   3),
-    round(macro_f1(rf_cm),    3),
-    round(macro_f1(bayes_cm), 3),
-    round(macro_f1(polr_cm),  3)
-  )
-)
-
-kable(comparison, caption = "Test-set performance across all models")
-```
+# Abstract
+
+We study a sports question that is more specific than generic player prediction: among highly drafted NBA players, why do some become flops while others justify or exceed draft expectations? We use public NBA data accessed through `hoopR`, combine early-career box score statistics with draft information, and model longer-run career outcomes using four tiers: `Out of League`, `Role Player`, `Starter`, and `All-Star`. This outcome structure lets us study draft failure without reducing the problem to a crude bust-or-not binary. JIwon Park fits a multinomial logistic regression, Andy Ouyang fits a Bayesian multinomial model, and Stanley Ouyang fits a random forest benchmark. Preliminary results suggest that early scoring, playing time, and draft position are the strongest signals separating disappointing early picks from players who become reliable starters or stars.
+
+# Introduction
+
+NBA teams do not just care about whether a young player is good in the abstract. They care about whether that player justifies where he was picked. Missing on a high draft pick is one of the most expensive mistakes a front office can make, so the more interesting sports question is not simply who becomes good, but why some highly drafted players still fail.
+
+Our project asks: among highly drafted NBA players, what features from the first one to three NBA seasons separate players who flop from players who meet or exceed draft expectations? We keep the response variable as four career tiers: `Out of League`, `Role Player`, `Starter`, and `All-Star`. This is useful because it preserves more structure than a binary bust label while still matching the real basketball question. A top pick who becomes only a bench player is very different from a top pick who becomes an All-Star, and the model should reflect that.
+
+This is a good sports analytics project because it is clearly motivated by decision-making under uncertainty. It also fits the course well: the outcome is multiclass, the predictors are interpretable, and uncertainty can be quantified in several different ways. Our preliminary takeaway is that early scoring production, early playing time, and draft position are the main variables separating disappointing early picks from players who develop into starters or stars. The three models differ in how they represent that pattern: multinomial logistic regression gives an interpretable baseline, the Bayesian model gives posterior uncertainty, and the random forest provides a flexible nonlinear benchmark.
+
+# Data
+
+We use public NBA player data accessed through `hoopR`. The dataset starts from season-level NBA player statistics from 2000 through 2015, joined with player-level draft information. We then construct player-level predictors using only the first one to three NBA seasons for each player.
+
+The response variable is a four-level career outcome category: `Out of League`, `Role Player`, `Starter`, and `All-Star`. The predictor set includes early-career scoring, rebounding, assists, steals, blocks, shooting percentages, minutes per game, number of observed early seasons, and draft pick. Players with extremely short appearances are filtered out during preprocessing, and the final modeling table uses one row per player.
+
+Although the full modeling table includes a broad set of drafted players, the main interpretation of the project is centered on highly drafted players. We use the broader sample to stabilize the model and preserve enough observations in each outcome tier, but the sports motivation remains the same: understanding why some early picks fail while others justify the investment.
+
+Major preprocessing steps are:
+
+1. Pull and cache season-level NBA player statistics.
+2. Keep the first one to three seasons for each player.
+3. Average early-career performance variables across those seasons.
+4. Join draft information and career outcome labels.
+5. Remove players with missing modeling fields.
+
+The EDA below shows why this project is interesting. First, stronger long-run outcomes are clearly associated with earlier draft position, which means expectations are different at the top of the draft. Second, early-career scoring already separates many eventual career paths. Together, these plots motivate the real question of the paper: conditional on being drafted highly, which early signals point toward a flop and which point toward a successful career?
+
+![Draft position by career outcome](main_files/figure-html/viz1-draft-1.png){width=80%}
+
+![Early-career scoring by outcome tier](main_files/figure-html/viz2-ppg-1.png){width=80%}
+
+# Methods
+
+## Jiwon Park
+
+Jiwon's model is a multinomial logistic regression for the four-level career outcome. Let \(Y_i\) denote the career tier for player \(i\). The model assumes that
+$$
+P(Y_i = k \mid x_i) = \frac{\exp(\alpha_k + x_i^\top \beta_k)}{\sum_{j=1}^K \exp(\alpha_j + x_i^\top \beta_j)}.
+$$
+with one category used as the baseline class. This is a natural course-aligned method because the response is multiclass and the model gives direct coefficient-based interpretation. For this project, the model is especially useful because it lets us ask how early-career variables shift the probability that a highly drafted player ends up disappointing versus becoming a starter or star.
+
+The predictors are early-career averages and draft information: `draft_pick`, `avg_ppg`, `avg_rpg`, `avg_apg`, `avg_spg`, `avg_bpg`, `avg_fg_pct`, `avg_fg3_pct`, `avg_ft_pct`, `avg_min_pg`, and `n_seasons`. Model evaluation is based on a held-out train/test split, with comparison through predictive accuracy and confusion-matrix behavior across the four outcome classes.
+
+Uncertainty is quantified with bootstrap confidence intervals for the regression coefficients. This is appropriate here because the main quantities of interest are coefficient directions and magnitudes rather than only one fitted point estimate, especially when comparing players whose early-career profiles are close to the boundary between flop and success.
+
+## Andy Ouyang
+
+Andy's model is a Bayesian multinomial logistic regression. It uses the same multiclass outcome structure, but places priors on model parameters and estimates posterior distributions rather than only point estimates. This is useful for the project because player-outcome prediction is inherently uncertain, especially for players near the boundary between role-player and starter outcomes.
+
+The Bayesian model uses a reduced predictor set to keep computation stable and interpretable: `draft_pick`, `avg_ppg`, `avg_rpg`, `avg_apg`, `avg_min_pg`, and `avg_fg_pct`. Weakly informative normal priors are placed on coefficients and intercepts. Evaluation is based on held-out predictive performance together with posterior class probabilities for illustrative player profiles.
+
+Uncertainty is quantified directly through posterior intervals and posterior predictive probabilities. This is appropriate because the model is designed to propagate uncertainty into the predicted outcome distribution itself.
+
+## Stanley Ouyang
+
+Stanley's model is a random forest classifier. Unlike the logistic models, the random forest does not impose a linear predictor structure. Instead, it builds an ensemble of decision trees to capture nonlinear patterns and interactions among early-career performance variables.
+
+This model is included as a benchmark. It is appropriate because relationships among minutes, scoring, efficiency, and draft position may be nonlinear. Evaluation is based on held-out predictive performance and variable-importance summaries, which show which predictors the model relies on most heavily. In substantive terms, the model checks whether the flop-versus-success question among early picks has nonlinear structure that the regression models miss.
+
+Uncertainty is quantified through out-of-bag error behavior and stability of the variable-importance ranking. This does not give parameter intervals like the regression approaches, but it still provides a defensible way to describe model uncertainty and instability in a flexible prediction setting.
+
+# Results
+
+## Jiwon Park
+
+The multinomial logistic regression serves as the baseline multiclass model. Preliminary coefficient estimates indicate that stronger early scoring and more playing time are positively associated with stronger career outcomes, while worse draft position works in the opposite direction. For the actual sports question, this means that highly drafted players who fail to earn early minutes or produce efficiently are much more likely to slide toward disappointing career outcomes than toward starter or star trajectories.
+
+The bootstrap-based uncertainty summaries are important here because they show that the model should not be interpreted as producing exact coefficient values. Instead, the main result is directional: early scoring, minutes, and draft position repeatedly appear as the strongest predictors separating successful early picks from flops.
+
+![Multinomial logistic regression coefficients](main_files/figure-html/multinom-coef-plot-1.png){width=82%}
+
+## Andy Ouyang
+
+The Bayesian multinomial model produces similar substantive conclusions, but with a more direct representation of predictive uncertainty. Rather than only assigning one class to a player, the model returns a distribution over possible career outcomes. That is valuable for this project because many highly drafted players are borderline cases early on rather than obvious stars or obvious flops.
+
+The preliminary profile comparison shows that a high-producing lottery pick has much more posterior mass on `Starter` and `All-Star`, while a modest low-pick profile has much more posterior mass on `Out of League` and `Role Player`. The uncertainty intervals around these probabilities are part of the result, not an afterthought, because the entire point of the project is that draft success and failure are uncertain early in a player's career.
+
+![Posterior probabilities for illustrative player profiles](main_files/figure-html/bayes-profiles-1.png){width=82%}
+
+## Stanley Ouyang
+
+The random forest gives a flexible benchmark and broadly agrees with the regression-based models about which inputs matter most. Variable importance suggests that early scoring, playing time, and draft position are again central. This consistency is useful because it suggests that the main project conclusions about flop risk among early picks are not driven by only one modeling choice.
+
+At the same time, the random forest is less interpretable than the regression models. Its main contribution is comparative: it helps us check whether nonlinear structure adds clear predictive value beyond the simpler multiclass regression approaches.
+
+![Random forest variable importance](main_files/figure-html/rf-varimp-1.png){width=82%}
+
+# Discussion
+
+The main conclusion of the draft is that early-career NBA production contains useful information about whether a highly drafted player will justify the pick. Across all three models, the most consistent signals are early scoring, early minutes, and where the player was selected in the draft. Put differently, draft position alone does not determine success. What happens in the first one to three seasons still meaningfully separates high picks who flop from high picks who become reliable starters or stars.
+
+The main limitation of the current draft is the construction of the career outcome labels. Before the final submission, we need to make those labels sharper and easier to defend, especially because the project is really about draft expectations and disappointment. A second limitation is that this draft currently emphasizes preliminary interpretation more than a full model-comparison table. The final report should include a compact comparison of predictive performance across all three approaches.
+
+The next steps are straightforward. First, finalize and justify the outcome labels in a way that better matches the idea of a draft flop. Second, present a cleaner side-by-side evaluation summary for all three models. Third, tighten the uncertainty discussion so that each individual's results subsection directly connects uncertainty to the question of draft success and failure rather than treating it as a technical add-on.
