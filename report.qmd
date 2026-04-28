@@ -189,19 +189,19 @@ Can a player's first few NBA seasons reliably predict where their career will en
 
 # Introduction
 
-One of the central challenges in basketball personnel decisions is evaluating players before their careers have fully developed. NBA teams must make roster and contract commitments based on limited data and the cost of being wrong (giving up on a future star too early or investing heavily in a player who never breaks out) is enormous. This pressure is sharpest at the top of the draft. Missing on a high pick is one of the most expensive mistakes a front office can make, because those picks carry both the highest expectations and the highest opportunity cost. This raises a fundamental prediction question: how much does a player's first one to three seasons in the league actually tell us about where their career will end up?
+One of the central challenges in basketball personnel decisions is evaluating players before their careers have fully developed. NBA teams must make roster and contract commitments based on limited data and the cost of being wrong (giving up on a future star too early or investing heavily in a player who never breaks out) is enormous. For example, the Clippers traded away SGA for Paul George, which proved to be a big blunder. This pressure is sharpest at the top of the draft. Missing on a high pick is one of the most expensive mistakes a front office can make, because those picks carry both the highest expectations and the highest opportunity cost. This raises a fundamental prediction question: how much does a player's first one to three seasons in the league actually tell us about where their career will end up?
 
-The question is harder than it looks. Early NBA performance is a noisy signal. Rookies vary enormously in how ready they are to contribute right away, and the circumstances surrounding a young player — their team, their role, their competition for minutes — shape their statistics in ways that may not reflect their true talent. Ben Simmons is a striking example: through his first three seasons he was an elite facilitator and defender, averaging over 15 points, 8 rebounds, and 8 assists per game and earning an All-Star selection. By conventional early-career metrics he looked like a franchise cornerstone. Yet his career derailed dramatically, in large part due to a refusal to shoot that became impossible to ignore as defenses adjusted. His early statistics were genuinely impressive but also genuinely misleading about his long-run ceiling. Cases like his are a reminder that early-career prediction is uncertain, not just difficult — and that even high draft position combined with strong early numbers is no guarantee of a sustained career.
+The question is harder than it looks. Early NBA performance is a noisy signal. Rookies vary enormously in how ready they are to contribute right away, and the circumstances surrounding a young player such as their team, their role, and competition for minutes shape their statistics in ways that may not reflect their true talent. Ben Simmons is a clear example: through his first three seasons he was an elite facilitator and defender, averaging over 15 points, 8 rebounds, and 8 assists per game and earning an All-Star selection. By conventional early-career metrics he looked like would be a key player for the Sixers. Yet his career derailed dramatically due to several factors including injuries, work ethic, and refusing to shoot. His early statistics were genuinely impressive but also genuinely misleading about his long-run ceiling. Cases like his are a reminder that early-career prediction is uncertain and that even high draft position combined with strong early numbers is no guarantee of a sustained career.
 
-Despite that uncertainty, the question is worth asking quantitatively. Our project models career outcome tier — `Out of League`, `Role Player`, `Starter`, or `All-Star` — as a function of early-career performance averages and draft position. Draft pick is included as a predictor both because it captures pre-NBA expectations and because it is correlated with the opportunities and roles a young player receives. We use three modeling approaches that differ in how they handle uncertainty and nonlinearity: multinomial logistic regression for interpretable coefficient-based inference, a Bayesian multinomial model for full posterior uncertainty quantification, and a random forest as a flexible nonlinear benchmark. Together they let us assess both what predicts career outcomes and how confident we should be in those predictions given the noisiness of early-career data.
+Despite that uncertainty, the question is worth asking quantitatively. Our project models career outcome tiers: `Out of League`, `Role Player`, `Starter`, or `All-Star` as a function of early-career performance averages and draft position. Draft pick is included as a predictor both because it captures pre-NBA expectations and because it is correlated with the opportunities and roles a young player receives. We use three modeling approaches that were motivated by class examples: multinomial logistic regression for interpretable coefficient-based inference, a Bayesian multinomial model for full posterior uncertainty quantification, and a random forest as a flexible nonlinear benchmark. Together they let us assess both what predicts career outcomes and how confident we should be in those predictions given the noisiness of early-career data.
 
 # Data
 
 We use public NBA player data accessed through `hoopR`, pulling season-level box score statistics for all players who appeared in at least ten games in any season from 2000 through 2015. The ten-game floor removes injury-shortened appearances that would otherwise introduce noise into early-career averages. For each player, we identify their debut season and retain only their first one to three NBA seasons, then compute per-player averages across those seasons: points, rebounds, assists, steals, blocks, field goal percentage, three-point percentage, free throw percentage, and minutes per game. We also record how many seasons were observed (`n_seasons`), since some players have only one or two early seasons available in the window.
 
-Career outcome labels are constructed from each player's full career totals, also pulled via `hoopR`. We define the four tiers as follows: **All-Star** requires a career scoring average above 18 points per game sustained over at least eight approximate seasons; **Starter** requires either a career minutes average above 28 per game or sustained scoring above 14 points per game over at least six seasons; **Role Player** requires at least 15 career minutes per game over four or more seasons; and everyone else is labeled **Out of League**. These thresholds are approximations — we discuss their limitations below — but they broadly align with how practitioners distinguish career levels. Draft position is joined from player biographical data, also via `hoopR`, and players without a recorded draft number (undrafted players) are excluded, leaving one row per player in the final modeling table.
+Career outcome labels are constructed from each player's full career totals, also pulled via `hoopR`. We define the four tiers as follows: **All-Star** requires a career scoring average above 18 points per game sustained over at least eight approximate seasons; **Starter** requires either a career minutes average above 28 per game or sustained scoring above 14 points per game over at least six seasons; **Role Player** requires at least 15 career minutes per game over four or more seasons; and everyone else is labeled **Out of League**. These thresholds are approximations of career success, which is itself unclear. In hindset, there were limitations with this approach that we will discuss later. Draft position is joined from player biographical data, also via `hoopR`, and players without a recorded draft number (undrafted players) are excluded, leaving one row per player in the final modeling table.
 
-The first plot below shows how draft position relates to long-run outcome. Earlier picks are clearly concentrated among better outcomes, but the overlap is substantial: many lottery picks end up as Role Players or Out of League, and some late picks become Starters. This overlap is precisely what motivates the modeling — draft position is informative but far from deterministic, and the question is whether early-career performance adds predictive signal on top of it.
+The first plot below shows how draft position relates to long-run outcome. Earlier picks are clearly associated with better outcomes, but the overlap is substantial: many lottery picks end up as Role Players or Out of League, and some late picks become Starters. This overlap shows how draft position is informative but far from deterministic, and the question is whether early-career performance adds predictive signal on top of it.
 
 ```{r viz1-draft, fig.width=8, fig.height=5, fig.cap="Draft position by career outcome. Lower pick number = higher draft position. The substantial overlap across tiers motivates using early-career statistics alongside draft pick as predictors."}
 model_data |>
@@ -226,7 +226,7 @@ model_data |>
   theme(legend.position = "none")
 ```
 
-Early scoring production separates outcome tiers more cleanly. The density plot below shows that All-Stars and Starters score substantially more in their first three seasons than Role Players or players who wash out, with relatively little overlap at the extremes. At the same time, the distributions are not perfectly separated — moderate early scorers appear across all four outcome tiers, which is consistent with the idea that early production is a useful but imperfect signal.
+Early scoring production separates outcome tiers more cleanly. The density plot below shows that All-Stars and Starters score substantially more in their first three seasons than Role Players or players who wash out, with relatively little overlap at the extremes. At the same time, the distributions are not perfectly separated where moderate early scorers appear across all four outcome tiers, which is consistent with the idea that early production is a useful but imperfect signal. 
 
 ```{r viz2-ppg, fig.width=8, fig.height=5, fig.cap="Distribution of average points per game in the first 1–3 seasons by career outcome tier. Better outcomes are associated with higher early scoring, though the distributions overlap considerably in the middle."}
 model_data |>
@@ -316,9 +316,11 @@ Uncertainty is quantified directly through posterior credible intervals and post
 
 ## Stanley Ou - Random Forest
 
-Lastly, we fit a random forest classifier using the `ranger` package. Unlike the logistic models, the random forest does not impose a linear predictor structure — it builds an ensemble of 500 decision trees that can capture nonlinear relationships and interactions among early-career variables. This is a natural complement to the regression approaches because the relationship between, say, scoring and career outcome may not be linear: high scoring might matter much more when accompanied by high minutes, and vice versa.
+Lastly, we fit a random forest classifier using the `ranger` package. The motivation for using a tree-based model here is that it could capture how scouts and front offices actually think about young players, in terms of their numbers. A tree can naturally express logic like "if a rookie averages above 25 minutes per game and scores at least 14 points, they look like a Starter trajectory; otherwise check whether efficiency is high enough to support a bench role." Trees also handle the four-tier outcome structure directly and naturally. 
 
-The `mtry` hyperparameter (the number of predictors considered at each split) is selected via cross-validation between $\lfloor\sqrt{p}\rfloor$ and $\lfloor p/3 \rfloor$, choosing the value with lower out-of-bag (OOB) error. The OOB error rate provides a natural in-training uncertainty estimate without requiring a separate validation set, and variable importance scores (mean decrease in Gini impurity) summarize which early-career statistics the model relies on most heavily. Held-out test accuracy and macro-averaged F1 allow direct comparison with the regression-based models.
+Since decision trees tend to overfit, we used a random forest with an ensemble of 500 trees. Each tree is trained on a different bootstrap sample of the training data, and at each split is allowed to consider only a random handful of the predictors rather than all of them. Averaging the predictions across the forest may result in more accurate predictions than a single model. It complements the regression approaches because it can pick up nonlinear effects and interactions, for example, the idea that high scoring matters much more when paired with high minutes, without us having to specify them in advance.
+
+The main hyperparameter, `mtry`, controls how many predictors each split is allowed to consider. We pick between $\lfloor\sqrt{p}\rfloor$ and $\lfloor p/3 \rfloor$ using out-of-bag (OOB) error, which is essentially a free, built-in validation score: every prediction is averaged only over the trees that did not see that player during training. Variable importance is summarized by mean decrease in Gini impurity, which ranks predictors by how much they help the trees separate the four outcome classes. Held-out test accuracy and macro-averaged F1 are then used for direct comparison against the two regression-based models.
 
 # Results
 
@@ -644,9 +646,9 @@ rf_pred <- predict(rf_fit, data = test_data)$predictions
 rf_cm   <- confusionMatrix(rf_pred, test_data$outcome)
 ```
 
-The random forest gives a flexible benchmark and broadly agrees with the regression-based models about which inputs matter most. Variable importance confirms that early scoring, playing time, and draft position are again the central predictors. This consistency is meaningful: it suggests that the main conclusions about career outcome prediction from early statistics are not an artifact of one modeling choice.
+The random forest gives a flexible benchmark and broadly agrees with the regression-based models about which inputs matter most. Variable importance confirms that early scoring, playing time, and draft position are again the central predictors. This consistency is meaningful and suggests that the main conclusions about career outcome prediction from early statistics isn't dependent on model choice.
 
-The random forest is less interpretable than the regression models, but its main contribution here is comparative. It checks whether nonlinear structure adds clear predictive value beyond the simpler multiclass regression approaches. The OOB error rate provides a natural in-training uncertainty estimate that complements the test-set evaluation.
+Although RFs are less interpretable than regression models, we can use the variable importance plot below to understand which factors led to certain prediction outcomes. Two predictors stand out well above the rest: average points per game and average minutes per game in the first three seasons. They are essentially tied at the top, which fits the intuition that early scoring and early playing time together capture most of what teams are signaling about a young player's role and trajectory. Below them, the next tier is made up of the other counting stats such as steals, rebounds, and assists. It is interesting to see that almost all box score stats mattered for the model.
 
 ```{r rf-varimp, fig.width=8, fig.height=5, fig.cap="Random forest variable importance (mean decrease in Gini impurity)."}
 vimp <- sort(rf_fit$variable.importance, decreasing = TRUE)
@@ -660,6 +662,8 @@ data.frame(predictor = names(vimp), importance = vimp) |>
        x = NULL, y = "Importance") +
   theme_minimal(base_size = 13)
 ```
+
+Draft pick lands in the middle of the pack rather than at the top. This is consistent with what the regression models suggested: draft position carries information about a prospect, but once early-career production is also in the model, much of the signal in the draft pick is already being expressed through the player's actual on-court statistics. The shooting percentage variables (free throw, field goal, three-point) sit a step lower in importance than the counting stats, which makes sense for tier prediction since efficiency doesn't factor in how long a player plays. Finally, `n_seasons` is by far the least important predictor, which is reassuring since it confirms that whether we observed one, two, or three seasons of a young player is mostly absorbed by the actual statistics from those seasons rather than acting as an independent signal.
 
 ## Model Comparison
 
@@ -684,16 +688,19 @@ comparison <- data.frame(
 )
 
 kable(comparison, caption = "Test-set performance across all three models")
+```
 
+At the aggregate level, the three models land in a narrow band. The random forest has the highest accuracy (0.678), the Bayesian model is essentially tied with it (0.672), and the multinomial logistic regression trails slightly (0.655). Macro-F1, which weights all four classes equally rather than by frequency, tells a different story: the Bayesian model leads (0.577) while the random forest is actually the worst on this metric (0.526). That gap between accuracy and macro-F1 reveals how the random forest is worse at classifying the rarer classes.
+
+```{r precision-recall}
 get_per_class_metrics <- function(cm, model_name) {
   df <- as.data.frame(cm$byClass)
-  
+
   data.frame(
     Model     = model_name,
     Class     = rownames(df),
     Precision = round(df$`Pos Pred Value`, 3),
-    Recall    = round(df$Sensitivity, 3),
-    F1        = round(df$F1, 3)
+    Recall    = round(df$Sensitivity, 3)
   )
 }
 
@@ -705,20 +712,72 @@ per_class_table <- rbind(
 
 rownames(per_class_table) <- NULL
 
-library(tidyr)
+precision_table <- per_class_table |>
+  dplyr::select(Class, Model, Precision) |>
+  pivot_wider(names_from = Model, values_from = Precision)
 
-per_class_wide <- per_class_table |>
-  pivot_wider(
-    names_from = Model,
-    values_from = c(Precision, Recall, F1)
-  )
+recall_table <- per_class_table |>
+  dplyr::select(Class, Model, Recall) |>
+  pivot_wider(names_from = Model, values_from = Recall)
 
-kable(per_class_wide)
+kable(precision_table, caption = "Per-class precision for each model.")
+kable(recall_table,    caption = "Per-class recall for each model.")
 ```
+
+
+The per-class precision and recall tables make that tradeoff explicit. On the two majority classes (`Out of League` and `Role Player`), all three models perform similarly, with precision and recall both sitting in the 0.65–0.79 range. The interesting disagreement appears in the smaller classes. For `Starter`, the random forest has the best precision (0.579) and recall (0.379), but recall is still below 40% across all three models. This suggests that most players who actually become Starters get pushed into adjacent tiers by every model. For `All-Star`, we see the opposite where the multinomial LR and Bayesian model both reach 0.60 precision with 0.375 recall, while the random forest collapses to 0.25 precision and 0.125 recall, meaning it correctly flags only a handful of true All-Stars in the held-out set. This `All-Star` shortfall is what drags the random forest's macro-F1 down. For an applied use case, the choice between models depends on whether identifying rare stars matters more than overall classification accuracy.
+
+## Player-Level Predictions
+
+To illustrate how the models behave on specific players rather than only in aggregate, we generate predictions from all three models on a stratified sample of held-out players and compare them to each player's actual career outcome. This serves as a sanity check and is also interesting to see if the models' predictions matches our preconceived understanding of these players. 
+
+```{r player-predictions}
+player_lookup <- season_stats |>
+  group_by(player_id) |>
+  summarise(player = first(player), .groups = "drop")
+
+model_data_named <- model_data |>
+  left_join(player_lookup, by = "player_id") |>
+  dplyr::select(player, player_id, outcome, draft_pick,
+                avg_ppg, avg_rpg, avg_apg, avg_spg, avg_bpg,
+                avg_fg_pct, avg_fg3_pct, avg_ft_pct,
+                avg_min_pg, n_seasons) |>
+  na.omit()
+
+test_data_named <- model_data_named[-train_idx, ]
+
+mlr_player_pred <- predict(mlr_fit, newdata = test_data_named)
+rf_player_pred  <- predict(rf_fit,  data    = test_data_named)$predictions
+
+predictions_table <- data.frame(
+  Player    = test_data_named$player,
+  DraftPick = test_data_named$draft_pick,
+  Actual    = test_data_named$outcome,
+  MLR       = mlr_player_pred,
+  Bayes     = bayes_pred,
+  RF        = rf_player_pred
+)
+
+set.seed(123)
+sample_table <- predictions_table |>
+  group_by(Actual) |>
+  slice_sample(n = 4) |>
+  ungroup() |>
+  arrange(Actual, DraftPick)
+
+kable(sample_table,
+      col.names = c("Player", "Draft Pick", "Actual",
+                    "MLR Pred", "Bayes Pred", "RF Pred"),
+      caption = "Predicted vs. actual career outcomes for a stratified sample of 16 held-out players (4 per outcome tier).")
+```
+
+
+At a high level, we see that across all models, players are typically classified at least one tier within their true label. I.e we don't see any all stars classified as out of league. 
+The per-player view reinforces the patterns visible in the precision and recall tables. The models broadly agree with one another more often than they disagree, and when they err they tend to err in the same direction usually toward `Out of League` or `Role Player`, the two most common classes. 
 
 # Discussion
 
-The main conclusion we found is that early career NBA production contains meaningful information about long-run career outcomes. Across all three models, the most consistent signals are early scoring production and early playing time. Draft position alone does not determine success — the EDA shows substantial overlap across outcome tiers — but combined with early performance statistics it meaningfully separates players who wash out from those who become reliable starters or stars. The consistency of this result across a multinomial logistic regression, a Bayesian multinomial model, and a random forest strengthens confidence in the conclusion.
+The main conclusion we found is that early career NBA production contains meaningful information about long-run career outcomes. Across all three models, the most consistent signals are early scoring production and early playing time. Draft position alone does not determine success. From our EDA, we found substantial overlap across outcome tiers but combining with early performance statistics separates players who wash out from those who become reliable starters or stars. The consistency of this result across a multinomial logistic regression, a Bayesian multinomial model, and a random forest strengthens confidence in the conclusion.
 
 One key limitation is the construction of the career outcome labels. The thresholds used to define `All-Star`, `Starter`, `Role Player`, and `Out of League` are approximations based on career points per game and minutes per game rather than official accolade records. This means some borderline players may be misclassified, and the `All-Star` class in particular is small and may not perfectly capture true All-Star selections. A second limitation is survivorship bias: the data only includes players who appeared in at least ten games in a season, which removes very short-tenured players entirely and may distort the `Out of League` class. Third, the predictor set is limited to traditional box score statistics; advanced metrics such as VORP or BPM, or physical measurements from the draft combine, could improve prediction.
 
