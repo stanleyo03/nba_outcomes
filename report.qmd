@@ -185,7 +185,7 @@ test_data  <- model_data_clean[-train_idx, ]
 
 # Abstract
 
-Can a player's first few NBA seasons reliably predict where their career will end up? We use public NBA data accessed through `hoopR`, combining early-career box score statistics with draft information, to model career outcomes across four tiers: `Out of League`, `Role Player`, `Starter`, and `All-Star`. This structure captures more nuance than a simple "bust or not" framing, and allows us to ask how much signal exists in the first one to three seasons. To answer this question, we fit a multinomial logistic regression, a Bayesian multinomial model, and a random forest to predict career outcomes. Results suggest that early scoring, playing time, and draft position are the strongest predictors of a player's career trajectory.
+Can a player's first few NBA seasons reliably predict where their career will end up? We use public NBA data accessed through `hoopR`, combining early-career box score statistics with draft information, to model career outcomes across four tiers: `Out of League`, `Role Player`, `Starter`, and `All-Star`. This structure captures more nuance than a simple "bust or not" framing, and allows us to ask how much signal exists in the first one to three seasons. To answer this question, we fit a multinomial logistic regression, a Bayesian multinomial model, and a random forest to predict career outcomes. Results suggest that early scoring, playing time, and draft position are the strongest predictors of a player's career trajectory. This [GitHub repository](https://github.com/stanleyo03/nba_outcomes) contains the report, data, and code used. 
 
 # Introduction
 
